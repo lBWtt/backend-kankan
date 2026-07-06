@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.core.errors import AppError
 from app.core.pagination import decode_cursor, encode_cursor
+from app.core.utils import parse_datetime_cursor, safe_like_pattern
 from app.models import (
     ClueSubscription,
     Favorite,
@@ -75,8 +76,9 @@ def list_published(
     stmt = select(Project).where(Project.status == "published", Project.deleted_at.is_(None))
 
     if q:
-        like = f"%{q}%"
         # MVP 搜索：标题/亮点模糊 + 工具精确命中（GIN）；中文分词升级是后续项
+        # 使用 safe_like_pattern 转义特殊字符 % 和 _，防止模式注入
+        like = safe_like_pattern(q)
         stmt = stmt.where(or_(Project.title.ilike(like), Project.tagline.ilike(like), Project.tools.any(q)))
     if domain:
         stmt = stmt.where(Project.domains.any(domain))
@@ -92,12 +94,7 @@ def list_published(
 
     stmt = stmt.order_by(Project.published_at.desc(), Project.id.desc())
     if cursor:
-        dt_s, id_s = decode_cursor(cursor, 2)
-        try:
-            c_dt = datetime.fromisoformat(dt_s)
-            c_id = uuid.UUID(id_s)
-        except ValueError:
-            raise AppError(422, "VALIDATION_FAILED", "cursor 无效")
+        c_dt, c_id = parse_datetime_cursor(cursor)
         stmt = stmt.where(tuple_(Project.published_at, Project.id) < (c_dt, c_id))
     elif page and page > 1:
         # 兼容 page 参数（契约 §1）；优先 cursor
