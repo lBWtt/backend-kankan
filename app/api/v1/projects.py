@@ -28,6 +28,7 @@ from app.services.interactions import how_to_interest_count
 from app.services.publishing import create_user_project, soft_delete_project, update_user_project
 from app.services.projects import (
     card_from_project,
+    cards_from_projects_with_stats,
     clue_related_projects,
     detail_from_project,
     get_visible_project,
@@ -63,8 +64,11 @@ def list_projects(
         cursor=cursor,
         page_size=page_size,
         page=page,
+        load_author=True,  # 预加载作者，避免 N+1
     )
-    return Page[ProjectCard](items=[card_from_project(p) for p in rows], next_cursor=next_cursor, has_more=has_more)
+    # 使用批量组装函数，填充 author 和 counts
+    items = cards_from_projects_with_stats(db, rows)
+    return Page[ProjectCard](items=items, next_cursor=next_cursor, has_more=has_more)
 
 
 @router.post(

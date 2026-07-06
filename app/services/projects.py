@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import List, Optional, Tuple
 
 from sqlalchemy import func, or_, select, tuple_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.core.errors import AppError
 from app.core.pagination import decode_cursor, encode_cursor
@@ -41,7 +41,8 @@ from app.schemas.project import (
 from app.schemas.user import UserBrief
 
 
-def card_from_project(p: Project) -> ProjectCard:
+def card_from_project(p: Project, author: Optional[UserBrief] = None, counts: Optional[ProjectCounts] = None) -> ProjectCard:
+    """项目卡片组装。可选参数 author/counts 用于列表端点填充作者和计数；默认为 None 保持向后兼容。"""
     return ProjectCard(
         id=p.id,
         title=p.title,
@@ -58,6 +59,8 @@ def card_from_project(p: Project) -> ProjectCard:
         tools=p.tools or [],
         ai_badge=p.ai_badge,
         published_at=p.published_at,
+        author=author,
+        counts=counts,
     )
 
 
@@ -70,9 +73,15 @@ def list_published(
     cursor: Optional[str],
     page_size: int,
     page: Optional[int],
+    load_author: bool = False,
 ) -> Tuple[List[Project], Optional[str], bool]:
-    """发现流查询：只取 published 且未软删；返回 (本页项目, next_cursor, has_more)。"""
+    """发现流查询：只取 published 且未软删；返回 (本页项目, next_cursor, has_more)。
+    load_author=True 时使用 selectinload 预加载作者，避免 N+1。"""
     stmt = select(Project).where(Project.status == "published", Project.deleted_at.is_(None))
+    
+    # 预加载 author（用于列表端点填充 author 字段）
+    if load_author:
+        stmt = stmt.options(selectinload(Project.author))
 
     if q:
         like = f"%{q}%"
@@ -151,10 +160,11 @@ def clue_related_projects(db: Session, p: Project, limit: int = 6) -> List[Proje
 
 
 def list_linked_projects(
-    db: Session, link_model, user: User, cursor: Optional[str], page_size: int
+    db: Session, link_model, user: User, cursor: Optional[str], page_size: int, load_author: bool = False
 ) -> Tuple[List[Project], Optional[str], bool]:
     """我的收藏/想试列表：按动作时间倒序，游标=（动作时间,动作行id）；
-    只展示仍是 published 的项目（被下架/删除的自动隐藏，不报错）。"""
+    只展示仍是 published 的项目（被下架/删除的自动隐藏，不报错）。
+    load_author=True 时使用 selectinload 预加载作者，避免 N+1。"""
     stmt = (
         select(link_model, Project)
         .join(Project, Project.id == link_model.project_id)
@@ -165,6 +175,10 @@ def list_linked_projects(
         )
         .order_by(link_model.created_at.desc(), link_model.id.desc())
     )
+    # 预加载 author（用于列表端点填充 author 字段）
+    if load_author:
+        stmt = stmt.options(selectinload(Project.author))
+    
     if cursor:
         dt_s, id_s = decode_cursor(cursor, 2)
         try:
@@ -227,6 +241,113 @@ def counts_for_project(db: Session, pid: uuid.UUID) -> ProjectCounts:
         takeaways=takeaway_count,
         reactions=reactions,
     )
+
+
+def counts_for_projects(db: Session, project_ids: List[uuid.UUID]) -> dict[uuid.UUID, ProjectCounts]:
+    """批量获取多个项目的互动计数，避免 N+1 查询。
+    返回 {project_id: ProjectCounts} 字典，未找到的项目返回默认零计数。"""
+    if not project_ids:
+        return {}
+
+    # 批量查询 favorites
+    fav_rows = db.execute(
+        select(Favorite.project_id, func.count())
+        .where(Favorite.project_id.in_(project_ids))
+        .group_by(Favorite.project_id)
+    ).all()
+    fav_counts = {pid: c for pid, c in fav_rows}
+
+    # 批量查询 tries
+    try_rows = db.execute(
+        select(TryItem.project_id, func.count())
+        .where(TryItem.project_id.in_(project_ids))
+        .group_by(TryItem.project_id)
+    ).all()
+    try_counts = {pid: c for pid, c in try_rows}
+
+    # 批量查询 how_to_interests
+    hti_rows = db.execute(
+        select(HowToInterest.project_id, func.count())
+        .where(HowToInterest.project_id.in_(project_ids))
+        .group_by(HowToInterest.project_id)
+    ).all()
+    hti_counts = {pid: c for pid, c in hti_rows}
+
+    # 批量查询 shares_completed
+    share_rows = db.execute(
+        select(Share.project_id, func.count())
+        .where(Share.project_id.in_(project_ids), Share.share_status == "completed")
+        .group_by(Share.project_id)
+    ).all()
+    share_counts = {pid: c for pid, c in share_rows}
+
+    # 批量查询 action_clicks
+    click_rows = db.execute(
+        select(ProjectActionEvent.project_id, func.count())
+        .where(ProjectActionEvent.project_id.in_(project_ids), ProjectActionEvent.event_type == "click")
+        .group_by(ProjectActionEvent.project_id)
+    ).all()
+    click_counts = {pid: c for pid, c in click_rows}
+
+    # 批量查询 takeaway_count（从 Project 表）
+    takeaway_rows = db.execute(
+        select(Project.id, Project.takeaway_count)
+        .where(Project.id.in_(project_ids))
+    ).all()
+    takeaway_counts = {pid: c or 0 for pid, c in takeaway_rows}
+
+    # 批量查询 reactions
+    reaction_rows = db.execute(
+        select(ProjectReaction.project_id, ProjectReaction.reaction_type, func.count())
+        .where(ProjectReaction.project_id.in_(project_ids))
+        .group_by(ProjectReaction.project_id, ProjectReaction.reaction_type)
+    ).all()
+    # 按 project_id 分组
+    reaction_by_project: dict[uuid.UUID, dict[str, int]] = {}
+    for pid, rt, c in reaction_rows:
+        if pid not in reaction_by_project:
+            reaction_by_project[pid] = {}
+        reaction_by_project[pid][rt] = c
+
+    # 组装结果
+    result: dict[uuid.UUID, ProjectCounts] = {}
+    for pid in project_ids:
+        reactions = ReactionCounts(**reaction_by_project.get(pid, {}))
+        result[pid] = ProjectCounts(
+            favorites=fav_counts.get(pid, 0),
+            tries=try_counts.get(pid, 0),
+            how_to_interests=hti_counts.get(pid, 0),
+            shares_completed=share_counts.get(pid, 0),
+            action_clicks=click_counts.get(pid, 0),
+            takeaways=takeaway_counts.get(pid, 0),
+            reactions=reactions,
+        )
+    return result
+
+
+def user_brief_from_user(u: Optional[User]) -> Optional[UserBrief]:
+    """从 User 模型构建 UserBrief；用户不存在或被软删时返回 None。"""
+    if u is None or u.deleted_at is not None:
+        return None
+    return UserBrief(id=u.id, nickname=u.nickname, avatar_url=u.avatar_url, role=u.role)
+
+
+def cards_from_projects_with_stats(db: Session, projects: List[Project]) -> List[ProjectCard]:
+    """批量组装项目卡片，填充 author 和 counts，避免 N+1 查询。
+    projects 必须已通过 selectinload(Project.author) 加载了 author 关系。"""
+    if not projects:
+        return []
+
+    project_ids = [p.id for p in projects]
+    counts_map = counts_for_projects(db, project_ids)
+
+    cards: List[ProjectCard] = []
+    for p in projects:
+        # author 通过 eager load 已加载，直接使用
+        author = user_brief_from_user(p.author)
+        counts = counts_map.get(p.id, ProjectCounts())
+        cards.append(card_from_project(p, author=author, counts=counts))
+    return cards
 
 
 def _viewer_state(db: Session, pid: uuid.UUID, user: Optional[User]) -> ViewerState:

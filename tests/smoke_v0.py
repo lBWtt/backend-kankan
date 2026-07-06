@@ -154,6 +154,13 @@ def main():
     r = c.get("/api/v1/projects", params={"q": marker})
     items = r.json()["items"]
     check("发现页能搜到刚发布的 2 个项目", r.status_code == 200 and len(items) == 2, r.text[:200])
+    # 新增：卡片 author/counts 字段断言
+    first_card = items[0]
+    check("卡片包含 author 字段（UserBrief 形状）", "author" in first_card and isinstance(first_card["author"], dict), str(first_card.get("author")))
+    check("卡片 author.id 存在", first_card["author"] is not None and "id" in first_card["author"], str(first_card.get("author")))
+    check("卡片包含 counts 字段（ProjectCounts 形状）", "counts" in first_card and isinstance(first_card["counts"], dict), str(first_card.get("counts")))
+    check("卡片 counts.favorites ≥0", first_card["counts"] is not None and "favorites" in first_card["counts"], str(first_card.get("counts")))
+    check("卡片 counts.reactions 形状正确", first_card["counts"]["reactions"] is not None and "creative" in first_card["counts"]["reactions"], str(first_card["counts"].get("reactions")))
     r = c.get("/api/v1/projects", params={"q": marker, "page_size": 1})
     j = r.json()
     check("游标分页：第1页 1 条且 has_more", len(j["items"]) == 1 and j["has_more"] and j["next_cursor"])
